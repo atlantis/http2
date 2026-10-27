@@ -411,16 +411,10 @@ module HTTP2
       @state = new_state
       Log.trace { "; Stream is now #{state}" }
       if new_state == State::CLOSED
-        release_buffers
+        # keep the data: a client reads the response after the trailing HEADERS
+        # closes the stream (the buffer is write-closed by then); dropping the
+        # map entry is what lets the stream be collected
         connection.streams.remove(id)
-      end
-    end
-
-    # Releases stream buffers to allow GC to reclaim memory. Called when stream closes.
-    private def release_buffers : Nil
-      if d = @data
-        d.close
-        @data = nil
       end
     end
 

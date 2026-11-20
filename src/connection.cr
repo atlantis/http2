@@ -123,6 +123,9 @@ module HTTP2
     # ignored.
     def receive : Frame?
       frame = read_frame_header
+      while skip_frame_after_reset(frame)
+        frame = read_frame_header
+      end
       stream = frame.stream
 
       stream.receiving(frame)
@@ -212,6 +215,42 @@ module HTTP2
       Log.trace { "recv #{frame.debug(color: :light_cyan)}" }
 
       frame
+    end
+
+    # Frames the peer sent before receiving our RST_STREAM must be ignored, but
+    # DATA still counts against the connection window and header blocks must
+    # still be decoded to keep the HPACK table in sync (RFC 9113, 5.1 and 4.3).
+    # Frames after the peer's RST_STREAM still raise: the RFC only asks for a
+    # stream error there, so ending the connection is deliberately stricter.
+    private def skip_frame_after_reset(frame) : Bool
+      stream = frame.stream
+      return false unless stream.state.closed? && streams.reset?(stream.id)
+
+      case frame.type
+      when Frame::Type::DATA
+        consume_inbound_window_size(frame.size)
+        io.skip(frame.size)
+      when Frame::Type::HEADERS, Frame::Type::PUSH_PROMISE
+        read_padded(frame) do |size|
+          if frame.type.push_promise?
+            io.skip(4)
+            size -= 4
+          elsif frame.flags.priority?
+            io.skip(5)
+            size -= 5
+          end
+          begin
+            read_headers_payload(frame, size) { |buffer| decode_headers(buffer, HTTP::Headers.new) }
+          rescue HPACK::Error
+            raise Error.compression_error
+          end
+        end
+      else
+        return false
+      end
+
+      Log.trace { "  ignored: STREAM #{stream.id} was reset" }
+      true
     end
 
     private def read_data_frame(frame)
@@ -634,6 +673,9 @@ module HTTP2
       end
     rescue IO::Error
       # silence
+    ensure
+      # writers parked on flow control wait for a window that can't open now
+      streams.each(&.resume_senders)
     end
 
     def closed?

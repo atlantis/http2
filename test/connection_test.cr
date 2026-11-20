@@ -346,4 +346,77 @@ class HTTP2::ConnectionTest < Minitest::Test
     assert_equal 0, output.read_bytes(UInt32, IO::ByteFormat::BigEndian)
     assert_equal DEFAULT_INITIAL_WINDOW_SIZE, output.read_bytes(UInt32, IO::ByteFormat::BigEndian)
   end
+
+  def test_data_after_local_reset_is_ignored
+    # HALF_CLOSED_REMOTE is grpc's RST(NO_ERROR) after the server's trailers
+    {Stream::State::OPEN, Stream::State::HALF_CLOSED_REMOTE}.each do |state|
+      headers = HPACK::Encoder.new.encode(HTTP::Headers{":status" => "200"})
+      input = IO::Memory.new
+      write_frame(input, Frame::Type::DATA, Frame::Flags::PADDED, 1, Bytes[2, 42, 0, 0])
+      write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 3, headers)
+      input.rewind
+      connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
+      reset = connection.streams.create(state: state)
+      live = connection.streams.create(state: Stream::State::OPEN)
+      reset.send_rst_stream(Error::Code::NO_ERROR)
+
+      frame = connection.receive.not_nil!
+      assert frame.stream.same?(live)
+      assert_equal "200", live.headers[":status"]
+      refute connection.streams.has_key?(reset.id)
+    end
+  end
+
+  def test_data_after_local_reset_counts_against_connection_window
+    input = IO::Memory.new
+    3.times { write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, Bytes.new(DEFAULT_MAX_FRAME_SIZE)) }
+    write_frame(input, Frame::Type::SETTINGS, Frame::Flags::END_STREAM, 0)
+    input.rewind
+    output = IO::Memory.new
+    connection = Connection.new(IO::Stapled.new(input, output), :client)
+    stream = connection.streams.create(state: Stream::State::OPEN)
+    stream.send_rst_stream(Error::Code::CANCEL)
+    reset_size = output.size
+
+    assert_equal Frame::Type::SETTINGS, connection.receive.not_nil!.type
+
+    output.pos = reset_size
+    header = output.read_bytes(UInt32, IO::ByteFormat::BigEndian)
+    assert_equal Frame::Type::WINDOW_UPDATE.to_u8, header & 0xff
+    output.read_byte # flags
+    assert_equal 0, output.read_bytes(UInt32, IO::ByteFormat::BigEndian)
+  end
+
+  def test_headers_after_local_reset_keep_hpack_in_sync
+    encoder = HPACK::Encoder.new(indexing: HPACK::Indexing::ALWAYS)
+    headers = HTTP::Headers{":status" => "200", "grpc-status" => "0"}
+    trailers = encoder.encode(headers)
+    indexed = encoder.encode(headers)
+
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_STREAM, 1, trailers[0, 2])
+    write_frame(input, Frame::Type::CONTINUATION, Frame::Flags::END_HEADERS, 1, trailers[2..])
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 3, indexed)
+    input.rewind
+    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
+    reset = connection.streams.create(state: Stream::State::OPEN)
+    live = connection.streams.create(state: Stream::State::OPEN)
+    reset.send_rst_stream(Error::Code::CANCEL)
+
+    assert connection.receive.not_nil!.stream.same?(live)
+    assert_equal "0", live.headers["grpc-status"]
+    refute connection.streams.has_key?(reset.id)
+  end
+
+  def test_data_after_peer_reset_is_still_an_error
+    reset = {Frame::Type::RST_STREAM, Frame::Flags::None, 1, Bytes[0, 0, 0, 8]}
+    data = {Frame::Type::DATA, Frame::Flags::None, 1, Bytes[42]}
+    connection = new_connection(:server, reset, data)
+    stream = connection.streams.find(1)
+    stream.receiving(Frame.new(Frame::Type::HEADERS, stream))
+
+    connection.receive
+    error = assert_raises(Error) { connection.receive }
+    assert_equal Error::Code::STREAM_CLOSED, error.code
+  end
 end

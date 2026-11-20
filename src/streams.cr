@@ -2,12 +2,15 @@ require "./stream"
 require "sync/rw_lock"
 
 module HTTP2
+  MAX_RESET_STREAM_IDS = 1_000
+
   class Streams
     # :nodoc:
     protected def initialize(@connection : Connection, @type : Connection::Type)
       @streams = {} of Int32 => Stream
       @lock = Sync::RWLock.new
       @highest_remote_id = 0
+      @reset_ids = Deque(Int32).new
 
       case @type
       in .client?
@@ -87,6 +90,19 @@ module HTTP2
       @lock.write do
         @streams.delete(stream.id)
       end
+    end
+
+    # Remembers streams we reset, so their in-flight frames can be ignored
+    # (RFC 9113, 5.1). Bounded: frames arriving much later are errors again.
+    protected def reset(id : Int32) : Nil
+      @lock.write do
+        @reset_ids.shift if @reset_ids.size >= MAX_RESET_STREAM_IDS
+        @reset_ids << id
+      end
+    end
+
+    protected def reset?(id : Int32) : Bool
+      @lock.read { @reset_ids.includes?(id) }
     end
 
     # Checks stream ownership and allocation. Frame validity for the stream's

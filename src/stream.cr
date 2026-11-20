@@ -260,6 +260,7 @@ module HTTP2
       frame = Frame.new(Frame::Type::DATA, self, flags)
 
       if data.empty?
+        check_sendable!
         connection.send(frame)
         return
       end
@@ -268,8 +269,10 @@ module HTTP2
         size = 0
 
         @mutex.to_reference.synchronize do
+          check_sendable!
           while @outbound_window_size < 1 || connection.outbound_window_size < 1
             @senders.to_reference.wait
+            check_sendable!
           end
 
           size = {data.size, @outbound_window_size, connection.remote_settings.max_frame_size}.min
@@ -289,8 +292,17 @@ module HTTP2
       end
     end
 
+    # The window of a closed stream or connection never reopens.
+    private def check_sendable! : Nil
+      if connection.closed? || state.closed? || state.half_closed_local?
+        raise Error.stream_closed("STREAM #{id} is #{state}")
+      end
+    end
+
     # Closes the stream. Optionally reporting an error status.
     def send_rst_stream(error_code : Error::Code) : Nil
+      # recorded first so frames racing our RST_STREAM are ignored
+      connection.streams.reset(id)
       io = IO::Memory.new(RST_STREAM_FRAME_SIZE)
       io.write_bytes(error_code.value.to_u32, IO::ByteFormat::BigEndian)
       connection.send Frame.new(Frame::Type::RST_STREAM, self, payload: io.to_slice)
@@ -407,7 +419,10 @@ module HTTP2
 
     private def state=(@state)
       Log.trace { "; Stream is now #{state}" }
-      connection.streams.delete(self) if state.closed?
+      if state.closed?
+        connection.streams.delete(self)
+        resume_senders
+      end
     end
 
     # :nodoc:
